@@ -1,0 +1,213 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>ksubs</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 24px;
+    background: #0d0d10; color: #e8e8ea;
+    font: 15px/1.5 system-ui, "Segoe UI", sans-serif;
+  }
+  main { max-width: 960px; margin: 0 auto; }
+  h1 { font-size: 17px; font-weight: 600; margin: 0 0 16px; color: #9a9aa2; }
+
+  form { display: flex; gap: 8px; margin-bottom: 16px; }
+  input[type=url] {
+    flex: 1; padding: 10px 12px; border-radius: 8px;
+    border: 1px solid #2a2a32; background: #16161b; color: inherit; font: inherit;
+  }
+  input[type=url]:focus { outline: none; border-color: #4a7dff; }
+  button {
+    padding: 10px 18px; border: 0; border-radius: 8px;
+    background: #4a7dff; color: #fff; font: inherit; font-weight: 500; cursor: pointer;
+  }
+  button:disabled { background: #2a2a32; color: #6a6a72; cursor: default; }
+  label.opt { display: flex; align-items: center; gap: 6px; font-size: 13px; color: #8a8a92; }
+
+  /* player + subtitle overlay */
+  #stage { position: relative; aspect-ratio: 16/9; background: #000; border-radius: 10px; overflow: hidden; }
+  #player, #stage iframe { position: absolute; inset: 0; width: 100%; height: 100%; border: 0; }
+  #overlay {
+    position: absolute; left: 50%; transform: translateX(-50%);
+    bottom: 11%;                /* clear of YouTube's control bar */
+    pointer-events: none;       /* never swallow clicks on the player controls */
+    max-width: 90%; text-align: center;
+  }
+  #en {
+    display: inline-block; padding: 3px 12px; border-radius: 4px;
+    background: rgba(8,8,10,.72); color: #fff; font-weight: 500;
+    font-size: clamp(16px, 2.5vw, 25px);
+    text-shadow: 0 1px 3px #000, 0 0 2px #000;
+  }
+  #en:empty { display: none; }
+
+  /* our own fullscreen button: YouTube's would fullscreen the iframe alone and
+     leave the subtitle overlay behind, since the overlay lives outside it */
+  #fs {
+    position: absolute; right: 10px; top: 10px; z-index: 2;
+    padding: 5px 10px; font-size: 15px; line-height: 1;
+    background: rgba(8,8,10,.6); border-radius: 6px; opacity: .55;
+  }
+  #fs:hover { opacity: 1; }
+
+  #stage:fullscreen, #stage:-webkit-full-screen {
+    aspect-ratio: auto; width: 100vw; height: 100vh; border-radius: 0;
+  }
+  #stage:fullscreen #overlay { bottom: 8%; }
+  #stage:fullscreen #en { font-size: clamp(22px, 3vw, 44px); padding: 5px 18px; }
+
+  #status { display: flex; align-items: center; gap: 12px; margin-top: 14px; min-height: 32px; }
+  #bar { flex: 1; height: 4px; border-radius: 2px; background: #22222a; overflow: hidden; }
+  #fill { height: 100%; width: 0; background: #4a7dff; transition: width .3s; }
+  #msg { font-size: 13px; color: #9a9aa2; white-space: nowrap; }
+  #msg.err { color: #ff6b6b; white-space: normal; }
+  a.dl { font-size: 13px; color: #4a7dff; }
+  .hide { display: none; }
+</style>
+
+<main>
+  <h1>Korean → English subtitles</h1>
+
+  <form id="f">
+    <input id="url" type="url" placeholder="Paste a YouTube link" required>
+    <label class="opt" title="Transcribe on this PC instead of Groq. Same Whisper model, but ~1x the video length (a 15-min video takes ~15 min). Only worth it on very noisy audio, where local voice-detection filtering trims hallucinated repeats that Groq's API cannot."><input id="wh" type="checkbox"> Local (slow)</label>
+    <label class="opt" title="Use your Chrome cookies for age-restricted videos"><input id="ck" type="checkbox"> cookies</label>
+    <button id="go">Generate</button>
+  </form>
+
+  <div id="stage">
+    <div id="player"></div>
+    <div id="overlay"><div id="en"></div></div>
+    <button id="fs" title="Fullscreen (Esc to exit)">⛶</button>
+  </div>
+
+  <div id="status">
+    <div id="bar"><div id="fill"></div></div>
+    <span id="msg">Paste a link to start.</span>
+    <a id="dl" class="dl hide" href="#">Download .srt</a>
+  </div>
+</main>
+
+<script src="https://www.youtube.com/iframe_api"></script>
+<script>
+const $ = s => document.querySelector(s);
+let player = null, apiReady = false, pending = null;
+let cues = [], jobId = null, shown = null;
+
+function onYouTubeIframeAPIReady() {
+  apiReady = true;
+  if (pending) { mount(pending); pending = null; }
+}
+
+function videoId(u) {
+  const m = u.match(/(?:youtu\.be\/|[?&]v=|\/shorts\/|\/embed\/)([\w-]{11})/)
+         || u.match(/^\s*([\w-]{11})\s*$/);
+  return m ? m[1] : null;
+}
+
+function mount(id) {
+  if (!apiReady) { pending = id; return; }
+  if (player) { player.loadVideoById(id); return; }
+  player = new YT.Player('player', {
+    videoId: id,
+    // fs:0 hides YouTube's fullscreen button — it would fullscreen the iframe
+    // alone and the subtitles would vanish. #fs fullscreens the whole stage.
+    playerVars: { rel: 0, cc_load_policy: 0, fs: 0 },
+    events: {
+      onError: () => setMsg('This video blocks embedding — subtitles still work, use the .srt.', true)
+    }
+  });
+}
+
+$('#fs').onclick = () => {
+  const stage = $('#stage');
+  if (document.fullscreenElement) document.exitFullscreen();
+  else if (stage.requestFullscreen) stage.requestFullscreen().catch(() => {});
+};
+
+// cues are sorted, so binary search: immune to seeking, and shorter than
+// maintaining a running index with a reset.
+function cueAt(t) {
+  let lo = 0, hi = cues.length - 1, ans = -1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    if (cues[mid].start <= t) { ans = mid; lo = mid + 1; } else { hi = mid - 1; }
+  }
+  if (ans < 0) return null;
+  const c = cues[ans];
+  return t <= c.end ? c : null;
+}
+
+setInterval(() => {
+  if (!player || !player.getCurrentTime || !cues.length) return;
+  const c = cueAt(player.getCurrentTime());
+  if (c === shown) return;
+  shown = c;
+  $('#en').textContent = c ? (c.en || '') : '';
+}, 100);
+
+function setMsg(text, isErr) {
+  $('#msg').textContent = text;
+  $('#msg').classList.toggle('err', !!isErr);
+}
+
+const STAGES = {
+  audio:      'Fetching audio',
+  groq:       'Transcribing on Groq',
+  captions:   'Looking for Korean captions',
+  transcribe: 'Transcribing locally (slow)',
+  translate:  'Translating'
+};
+
+async function poll() {
+  const j = await (await fetch(`/jobs/${jobId}`)).json();
+  cues = j.cues || [];
+
+  // offer the download before bailing out: a failed translation still leaves
+  // a perfectly good Korean-only transcript
+  if (cues.length) $('#dl').classList.remove('hide');
+
+  if (j.stage === 'error') {
+    setMsg(j.error, true);
+    $('#go').disabled = false;
+    return;
+  }
+  if (j.stage === 'done') {
+    $('#fill').style.width = '100%';
+    const miss = j.untranslated ? ` · ${j.untranslated} untranslated` : '';
+    setMsg(`Done — ${cues.length} subtitles from ${j.source}${miss}`);
+    $('#go').disabled = false;
+    return;
+  }
+  $('#fill').style.width = j.percent + '%';
+  setMsg(`${STAGES[j.stage]}… ${j.percent}%` + (cues.length ? ` · ${cues.length} cues` : ''));
+  setTimeout(poll, 1000);
+}
+
+$('#f').onsubmit = async e => {
+  e.preventDefault();
+  const id = videoId($('#url').value);
+  if (!id) return setMsg('That does not look like a YouTube link.', true);
+
+  cues = []; shown = null;
+  $('#en').textContent = '';
+  $('#dl').classList.add('hide');
+  $('#go').disabled = true;
+  setMsg('Starting…');
+  mount(id);
+
+  const r = await fetch('/jobs', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      url: $('#url').value,
+      cookies: $('#ck').checked,
+      whisper: $('#wh').checked
+    })
+  });
+  jobId = (await r.json()).id;
+  $('#dl').href = `/jobs/${jobId}/srt`;
+  poll();
+};
+</script>
