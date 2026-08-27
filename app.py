@@ -92,10 +92,15 @@ def cookie_opts() -> dict:
         _cookie_file = str(f)
     return {
         "cookiefile": _cookie_file,
-        # yt-dlp's default player client errors with cookies set ("The page
-        # needs to be reloaded" - open yt-dlp bug as of Aug 2026); this client
-        # combination is the documented workaround
+        # once cookies are set, YouTube's default (tv_downgraded) client is
+        # broken server-side - this pair is yt-dlp's documented workaround
         "extractor_args": {"youtube": {"player_client": ["default", "web_embedded"]}},
+        # even with that, most clients now need YouTube's "n" JS challenge
+        # solved or every format gets silently dropped ("page needs to be
+        # reloaded"). This downloads yt-dlp's own solver script from
+        # github.com/yt-dlp/ejs on first use and caches it - it's yt-dlp's own
+        # official release, not arbitrary code, but it is a runtime fetch+run.
+        "remote_components": {"ejs:github"},
     }
 CLAUDE = shutil.which("claude") or "claude"
 
