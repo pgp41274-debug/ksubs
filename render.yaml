@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: ksubs
+    runtime: docker
+    plan: free
+    envVars:
+      - key: GROQ_API_KEY
+        sync: false   # set in the Render dashboard - never committed to git
+      - key: KSUBS_PASSWORD
+        sync: false   # anyone hitting the URL needs this to start a job

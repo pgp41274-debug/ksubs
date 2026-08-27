@@ -21,7 +21,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, PlainTextResponse
 
 # Windows consoles default to cp1252, which raises on Korean titles and cue text
@@ -33,6 +33,11 @@ for _s in (sys.stdout, sys.stderr):
 
 HERE = Path(__file__).parent
 MODEL = os.environ.get("KSUBS_MODEL", "large-v3-turbo")
+# set when deployed (Render etc): skip local Whisper (too heavy for a free 512MB
+# host) and gate every request behind a shared password so a public URL can't
+# spend someone else's Groq key
+HOSTED = bool(os.environ.get("KSUBS_PASSWORD"))
+KSUBS_PASSWORD = os.environ.get("KSUBS_PASSWORD", "")
 DEVICE = os.environ.get("KSUBS_DEVICE", "cpu")  # set KSUBS_DEVICE=cuda to try the MX450
 BATCH = 40
 WORKERS = 4  # parallel claude calls; translation is the bottleneck once captions are free
@@ -408,6 +413,11 @@ _model = None
 
 def load_model(log=print):
     global _model
+    if HOSTED:
+        raise RuntimeError(
+            "local Whisper isn't available on this deployment "
+            "(Groq and YouTube captions both missed on this video - try another)"
+        )
     if _model is None:
         from faster_whisper import WhisperModel
 
@@ -520,16 +530,49 @@ def run_job(job_id: str, url: str, cookies: bool, force_whisper: bool = False):
 
 # ---------------------------------------------------------------- web
 
+# injected into index.html only when hosted (KSUBS_PASSWORD set). Prompts once,
+# caches in this browser's localStorage, and patches fetch() so every POST /jobs
+# carries it - index.html itself needs no changes for the hosted case.
+INLINE_PASSWORD_SCRIPT = """
+<script>
+(function () {
+  const KEY = 'ksubs_pw';
+  const realFetch = window.fetch;
+  window.fetch = function (url, opts) {
+    if (typeof url === 'string' && url.startsWith('/jobs') && (!opts || !opts.method || opts.method === 'POST')) {
+      let pw = localStorage.getItem(KEY);
+      if (!pw) { pw = prompt('Password:') || ''; localStorage.setItem(KEY, pw); }
+      opts = opts || {};
+      opts.headers = Object.assign({}, opts.headers, {'X-Ksubs-Password': pw});
+      return realFetch(url, opts).then(r => {
+        if (r.status === 401) { localStorage.removeItem(KEY); alert('Wrong password - try again.'); }
+        return r;
+      });
+    }
+    return realFetch(url, opts);
+  };
+})();
+</script>
+"""
+
 app = FastAPI()
+
+
+def require_password(request: Request):
+    if HOSTED and request.headers.get("x-ksubs-password") != KSUBS_PASSWORD:
+        raise HTTPException(401, "wrong or missing password")
 
 
 @app.get("/")
 def index():
-    return HTMLResponse((HERE / "index.html").read_text(encoding="utf-8"))
+    page = (HERE / "index.html").read_text(encoding="utf-8")
+    if HOSTED:
+        page = page.replace("</main>", INLINE_PASSWORD_SCRIPT + "</main>")
+    return HTMLResponse(page)
 
 
 @app.post("/jobs")
-def create_job(body: dict):
+def create_job(body: dict, _=Depends(require_password)):
     job_id = uuid.uuid4().hex
     JOBS[job_id] = {
         "stage": "captions",
