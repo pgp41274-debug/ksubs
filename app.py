@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["fastapi", "uvicorn", "faster-whisper", "yt-dlp", "imageio-ffmpeg"]
+# dependencies = ["fastapi", "uvicorn", "faster-whisper", "yt-dlp", "imageio-ffmpeg", "deno"]
 # ///
 """Korean YouTube -> bilingual subtitles, watched in place. All local, no paid API."""
 from __future__ import annotations
