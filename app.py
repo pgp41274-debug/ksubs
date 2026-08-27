@@ -491,6 +491,27 @@ def transcribe(wav: Path, job: dict, log=print) -> list[dict]:
 
 # ---------------------------------------------------------------- job runner
 
+RENDER_ENV_URL = "https://dashboard.render.com/web/srv-da7o937avr4c73bb6qb0/env"
+
+
+def friendly_error(e: Exception) -> str:
+    """YouTube cookies on a datacenter IP die every few hours to days (a known,
+    widely-reported 2026 limitation, not a bug here) - turn yt-dlp's raw error
+    into the actual fix instead of a wall of technical text."""
+    msg = str(e)
+    if "not a bot" in msg or "Sign in to confirm" in msg:
+        return (
+            "YouTube's session cookies have expired (normal after a few hours "
+            f"on a cloud server) - refresh YTDLP_COOKIES at {RENDER_ENV_URL}"
+        )
+    if "page needs to be reloaded" in msg:
+        return (
+            "YouTube rejected this request (challenge failed) - try again in a "
+            f"moment, or refresh YTDLP_COOKIES if it persists: {RENDER_ENV_URL}"
+        )
+    return msg
+
+
 # ponytail: in-memory jobs, no persistence - add sqlite only if you want history
 JOBS: dict[str, dict] = {}
 
@@ -558,7 +579,7 @@ def run_job(job_id: str, url: str, cookies: bool, force_whisper: bool = False):
         job.update(stage="done", percent=100, untranslated=missing)
         log(f"done ({missing} cues left untranslated)")
     except Exception as e:
-        job.update(stage="error", error=str(e))
+        job.update(stage="error", error=friendly_error(e))
         log(f"FAILED: {e}")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

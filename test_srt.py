@@ -264,4 +264,24 @@ except RuntimeError as e:
 assert len(tried) == 1, f"a 400 must not rotate keys, tried {len(tried)}"
 print("ok  non-quota errors do not waste the backup key")
 
+# ---- friendly_error rewrites known YouTube failures -----------------------
+
+# exact strings pulled from real Render logs, not paraphrased
+bot_check = Exception(
+    "ERROR: [youtube] xj1NBNnlk4o: Sign in to confirm you’re not a bot. "
+    "Use --cookies-from-browser or --cookies for the authentication."
+)
+msg = app.friendly_error(bot_check)
+assert "YTDLP_COOKIES" in msg and "dashboard.render.com" in msg, msg
+assert "Sign in to confirm" not in msg, "raw yt-dlp text should be replaced, not appended"
+
+reload_err = Exception("ERROR: [youtube] xj1NBNnlk4o: The page needs to be reloaded.")
+msg = app.friendly_error(reload_err)
+assert "YTDLP_COOKIES" in msg, msg
+
+# an unrelated error must pass through untouched - this isn't a catch-all
+other = Exception("ERROR: [youtube] xj1NBNnlk4o: Video unavailable")
+assert app.friendly_error(other) == str(other)
+print("ok  friendly_error rewrites known YouTube failures, leaves others alone")
+
 print("\nall passed")
