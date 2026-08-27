@@ -90,7 +90,13 @@ def cookie_opts() -> dict:
         f = Path(tempfile.gettempdir()) / "ksubs_cookies.txt"
         f.write_text(raw, encoding="utf-8")
         _cookie_file = str(f)
-    return {"cookiefile": _cookie_file}
+    return {
+        "cookiefile": _cookie_file,
+        # yt-dlp's default player client errors with cookies set ("The page
+        # needs to be reloaded" - open yt-dlp bug as of Aug 2026); this client
+        # combination is the documented workaround
+        "extractor_args": {"youtube": {"player_client": ["default", "web_embedded"]}},
+    }
 CLAUDE = shutil.which("claude") or "claude"
 
 # ---------------------------------------------------------------- srt
