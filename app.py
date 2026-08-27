@@ -72,26 +72,36 @@ TRANSLATOR = os.environ.get("KSUBS_TRANSLATOR", "groq" if GROQ_KEY else "claude"
 YDL = {"quiet": True, "no_warnings": True, "noprogress": True,
        "js_runtimes": {"deno": {}, "node": {}}}  # node is installed; without it YT extraction degrades
 
-_cookie_file = None
+# YouTube's bot-check on datacenter IPs is intermittent, not a clean pass/fail
+# per account - the same cookies can succeed right after failing. Multiple
+# throwaway accounts don't guarantee a fix (the shared server IP is still one
+# factor), but give more chances per job. Separate cookie sets in YTDLP_COOKIES
+# with this marker line (won't collide with real cookies.txt content):
+COOKIE_SEP = "-----KSUBS-COOKIE-SEPARATOR-----"
+
+_cookie_files: list[str] | None = None
+_cookie_idx = 0  # sticky: keep using whichever set last worked
 
 
-def cookie_opts() -> dict:
-    """YouTube bot-checks datacenter IPs (Render, AWS, ...) on ordinary videos,
-    not just age-restricted ones - the fix is cookies from a real signed-in
-    session. Set YTDLP_COOKIES to the contents of a Netscape-format cookies.txt
-    (e.g. from the 'Get cookies.txt' browser extension). Applies to every
-    request when set - there's no browser on the server for the local
-    'cookiesfrombrowser' checkbox to read from."""
-    global _cookie_file
-    raw = os.environ.get("YTDLP_COOKIES", "")
-    if not raw:
+def _load_cookie_files() -> list[str]:
+    global _cookie_files
+    if _cookie_files is None:
+        raw = os.environ.get("YTDLP_COOKIES", "")
+        blocks = [b.strip() for b in raw.split(COOKIE_SEP) if b.strip()]
+        _cookie_files = []
+        for i, block in enumerate(blocks):
+            f = Path(tempfile.gettempdir()) / f"ksubs_cookies_{i}.txt"
+            f.write_text(block, encoding="utf-8")
+            _cookie_files.append(str(f))
+    return _cookie_files
+
+
+def cookie_opts(path: str | None) -> dict:
+    """Build yt-dlp opts for one cookie file (or {} for no cookies)."""
+    if not path:
         return {}
-    if _cookie_file is None:
-        f = Path(tempfile.gettempdir()) / "ksubs_cookies.txt"
-        f.write_text(raw, encoding="utf-8")
-        _cookie_file = str(f)
     return {
-        "cookiefile": _cookie_file,
+        "cookiefile": path,
         # once cookies are set, YouTube's default (tv_downgraded) client is
         # broken server-side - this pair is yt-dlp's documented workaround
         "extractor_args": {"youtube": {"player_client": ["default", "web_embedded"]}},
@@ -102,6 +112,38 @@ def cookie_opts() -> dict:
         # official release, not arbitrary code, but it is a runtime fetch+run.
         "remote_components": {"ejs:github"},
     }
+
+
+def _is_bot_check(e: Exception) -> bool:
+    msg = str(e)
+    return ("not a bot" in msg or "Sign in to confirm" in msg
+            or "page needs to be reloaded" in msg)
+
+
+def with_cookies(fn, log=print):
+    """Call fn(cookie_path) once per available cookie set, starting from
+    whichever one last worked, until one doesn't hit YouTube's bot-check.
+    fn(None) once if no cookies are configured at all."""
+    global _cookie_idx
+    files = _load_cookie_files()
+    if not files:
+        return fn(None)
+    last: Exception | None = None
+    for attempt in range(len(files)):
+        i = (_cookie_idx + attempt) % len(files)
+        try:
+            result = fn(files[i])
+            _cookie_idx = i
+            return result
+        except Exception as e:
+            if not _is_bot_check(e):
+                raise
+            last = e
+            if attempt + 1 < len(files):
+                log(f"  cookie set {i + 1}/{len(files)} bot-checked, trying set {i + 2}")
+    raise last
+
+
 CLAUDE = shutil.which("claude") or "claude"
 
 # ---------------------------------------------------------------- srt
@@ -406,7 +448,8 @@ def transcribe_groq(path: Path, log=print) -> list[dict]:
 # ---------------------------------------------------------------- audio + whisper
 
 
-def fetch_audio(url: str, outdir: Path, job: dict, cookies: bool = False, fmt: str = "wav"):
+def fetch_audio(url: str, outdir: Path, job: dict, cookies: bool = False,
+                fmt: str = "wav", log=print):
     import imageio_ffmpeg
     import yt_dlp
 
@@ -416,31 +459,34 @@ def fetch_audio(url: str, outdir: Path, job: dict, cookies: bool = False, fmt: s
             if tot:
                 job["percent"] = int(d.get("downloaded_bytes", 0) / tot * 100)
 
-    opts = {
-        "format": "bestaudio/best",
-        "outtmpl": str(outdir / "audio.%(ext)s"),
-        "quiet": True,
-        "no_warnings": True,
-        "noprogress": True,
-        "progress_hooks": [hook],
-        # YouTube extraction is degraded without a JS runtime; node is already installed
-        "js_runtimes": {"deno": {}, "node": {}},
-        # bundled static binary - no system ffmpeg needed, so this also runs on a
-        # bare Render container with nothing but Python installed
-        "ffmpeg_location": imageio_ffmpeg.get_ffmpeg_exe(),
-        # audio only, never the video; 16 kHz mono is what whisper wants anyway.
-        # mp3 32k keeps a 30-min video ~7 MB, well under Groq's 25 MB limit.
-        "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": fmt}],
-        "postprocessor_args": {
-            "extractaudio": ["-ar", "16000", "-ac", "1"]
-            + ([] if fmt == "wav" else ["-b:a", "32k"])
-        },
-        **cookie_opts(),
-    }
-    if cookies:
-        opts["cookiesfrombrowser"] = ("chrome",)
-    with yt_dlp.YoutubeDL(opts) as y:
-        info = y.extract_info(url, download=True)
+    def attempt(cookie_path):
+        opts = {
+            "format": "bestaudio/best",
+            "outtmpl": str(outdir / "audio.%(ext)s"),
+            "quiet": True,
+            "no_warnings": True,
+            "noprogress": True,
+            "progress_hooks": [hook],
+            # YouTube extraction is degraded without a JS runtime; node is already installed
+            "js_runtimes": {"deno": {}, "node": {}},
+            # bundled static binary - no system ffmpeg needed, so this also runs on a
+            # bare Render container with nothing but Python installed
+            "ffmpeg_location": imageio_ffmpeg.get_ffmpeg_exe(),
+            # audio only, never the video; 16 kHz mono is what whisper wants anyway.
+            # mp3 32k keeps a 30-min video ~7 MB, well under Groq's 25 MB limit.
+            "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": fmt}],
+            "postprocessor_args": {
+                "extractaudio": ["-ar", "16000", "-ac", "1"]
+                + ([] if fmt == "wav" else ["-b:a", "32k"])
+            },
+            **cookie_opts(cookie_path),
+        }
+        if cookies:
+            opts["cookiesfrombrowser"] = ("chrome",)
+        with yt_dlp.YoutubeDL(opts) as y:
+            return y.extract_info(url, download=True)
+
+    info = with_cookies(attempt, log)
     return outdir / f"audio.{fmt}", info.get("title", ""), info.get("id", "")
 
 
@@ -527,11 +573,15 @@ def run_job(job_id: str, url: str, cookies: bool, force_whisper: bool = False):
         import yt_dlp
 
         job.update(stage="captions", percent=0)
-        opts = dict(YDL, skip_download=True, **cookie_opts())
-        if cookies:
-            opts["cookiesfrombrowser"] = ("chrome",)
-        with yt_dlp.YoutubeDL(opts) as y:
-            info = y.extract_info(url, download=False)
+
+        def attempt(cookie_path):
+            opts = dict(YDL, skip_download=True, **cookie_opts(cookie_path))
+            if cookies:
+                opts["cookiesfrombrowser"] = ("chrome",)
+            with yt_dlp.YoutubeDL(opts) as y:
+                return y.extract_info(url, download=False)
+
+        info = with_cookies(attempt, log)
         job.update(title=info.get("title", ""), video_id=info.get("id", ""))
         log(f"video: {info.get('title', '')}")
 
@@ -541,7 +591,7 @@ def run_job(job_id: str, url: str, cookies: bool, force_whisper: bool = False):
         if GROQ_KEY and not force_whisper:
             try:
                 job.update(stage="audio", percent=0)
-                mp3, _, _ = fetch_audio(url, tmp, job, cookies, fmt="mp3")
+                mp3, _, _ = fetch_audio(url, tmp, job, cookies, fmt="mp3", log=log)
                 job.update(stage="groq", percent=0)
                 cues = transcribe_groq(mp3, log)
                 source = f"Groq {GROQ_MODEL}"
@@ -560,7 +610,7 @@ def run_job(job_id: str, url: str, cookies: bool, force_whisper: bool = False):
         if not cues:
             log("Whisper requested" if force_whisper else "no captions - using local Whisper")
             job.update(stage="audio", percent=0)
-            wav, _, _ = fetch_audio(url, tmp, job, cookies, fmt="wav")
+            wav, _, _ = fetch_audio(url, tmp, job, cookies, fmt="wav", log=log)
             job.update(stage="transcribe", percent=0)
             cues = transcribe(wav, job, log)
             source = "local Whisper"

@@ -284,4 +284,49 @@ other = Exception("ERROR: [youtube] xj1NBNnlk4o: Video unavailable")
 assert app.friendly_error(other) == str(other)
 print("ok  friendly_error rewrites known YouTube failures, leaves others alone")
 
+# ---- multi-cookie-set failover -------------------------------------------
+
+app._cookie_files = ["/set0.txt", "/set1.txt"]
+app._cookie_idx = 0
+seen = []
+
+
+def bot_checks_set0(path):
+    seen.append(path)
+    if path == "/set0.txt":
+        raise Exception("Sign in to confirm you’re not a bot.")
+    return "ok via " + path
+
+
+assert app.with_cookies(bot_checks_set0, log=lambda *a: None) == "ok via /set1.txt"
+assert seen == ["/set0.txt", "/set1.txt"], seen
+# must now stick to set1 rather than re-trying the bot-checked set0 first
+seen.clear()
+app.with_cookies(bot_checks_set0, log=lambda *a: None)
+assert seen == ["/set1.txt"], f"should stick to the working set, tried {seen}"
+print("ok  bot-checked cookie set fails over, working set sticks")
+
+# an unrelated failure (e.g. "Video unavailable") must not burn every cookie set
+app._cookie_idx = 0
+tried = []
+
+
+def unrelated_failure(path):
+    tried.append(path)
+    raise Exception("ERROR: [youtube] xj1NBNnlk4o: Video unavailable")
+
+
+try:
+    app.with_cookies(unrelated_failure, log=lambda *a: None)
+    raise AssertionError("should have raised")
+except Exception as e:
+    assert "Video unavailable" in str(e), e
+assert len(tried) == 1, f"a non-bot-check error must not rotate cookie sets, tried {tried}"
+print("ok  non-bot-check errors do not waste the backup cookie set")
+
+# no cookies configured at all -> fn(None) once, untouched
+app._cookie_files = []
+assert app.with_cookies(lambda p: p) is None
+print("ok  no cookies configured -> single call with None")
+
 print("\nall passed")
