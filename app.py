@@ -71,6 +71,26 @@ GROQ_MAX_MB = 25
 TRANSLATOR = os.environ.get("KSUBS_TRANSLATOR", "groq" if GROQ_KEY else "claude")
 YDL = {"quiet": True, "no_warnings": True, "noprogress": True,
        "js_runtimes": {"deno": {}, "node": {}}}  # node is installed; without it YT extraction degrades
+
+_cookie_file = None
+
+
+def cookie_opts() -> dict:
+    """YouTube bot-checks datacenter IPs (Render, AWS, ...) on ordinary videos,
+    not just age-restricted ones - the fix is cookies from a real signed-in
+    session. Set YTDLP_COOKIES to the contents of a Netscape-format cookies.txt
+    (e.g. from the 'Get cookies.txt' browser extension). Applies to every
+    request when set - there's no browser on the server for the local
+    'cookiesfrombrowser' checkbox to read from."""
+    global _cookie_file
+    raw = os.environ.get("YTDLP_COOKIES", "")
+    if not raw:
+        return {}
+    if _cookie_file is None:
+        f = Path(tempfile.gettempdir()) / "ksubs_cookies.txt"
+        f.write_text(raw, encoding="utf-8")
+        _cookie_file = str(f)
+    return {"cookiefile": _cookie_file}
 CLAUDE = shutil.which("claude") or "claude"
 
 # ---------------------------------------------------------------- srt
@@ -404,6 +424,7 @@ def fetch_audio(url: str, outdir: Path, job: dict, cookies: bool = False, fmt: s
             "extractaudio": ["-ar", "16000", "-ac", "1"]
             + ([] if fmt == "wav" else ["-b:a", "32k"])
         },
+        **cookie_opts(),
     }
     if cookies:
         opts["cookiesfrombrowser"] = ("chrome",)
@@ -474,7 +495,7 @@ def run_job(job_id: str, url: str, cookies: bool, force_whisper: bool = False):
         import yt_dlp
 
         job.update(stage="captions", percent=0)
-        opts = dict(YDL, skip_download=True)
+        opts = dict(YDL, skip_download=True, **cookie_opts())
         if cookies:
             opts["cookiesfrombrowser"] = ("chrome",)
         with yt_dlp.YoutubeDL(opts) as y:
