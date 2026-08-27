@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["fastapi", "uvicorn", "faster-whisper", "yt-dlp"]
+# dependencies = ["fastapi", "uvicorn", "faster-whisper", "yt-dlp", "imageio-ffmpeg"]
 # ///
 """Korean YouTube -> bilingual subtitles, watched in place. All local, no paid API."""
 from __future__ import annotations
@@ -376,6 +376,7 @@ def transcribe_groq(path: Path, log=print) -> list[dict]:
 
 
 def fetch_audio(url: str, outdir: Path, job: dict, cookies: bool = False, fmt: str = "wav"):
+    import imageio_ffmpeg
     import yt_dlp
 
     def hook(d):
@@ -393,6 +394,9 @@ def fetch_audio(url: str, outdir: Path, job: dict, cookies: bool = False, fmt: s
         "progress_hooks": [hook],
         # YouTube extraction is degraded without a JS runtime; node is already installed
         "js_runtimes": {"deno": {}, "node": {}},
+        # bundled static binary - no system ffmpeg needed, so this also runs on a
+        # bare Render container with nothing but Python installed
+        "ffmpeg_location": imageio_ffmpeg.get_ffmpeg_exe(),
         # audio only, never the video; 16 kHz mono is what whisper wants anyway.
         # mp3 32k keeps a 30-min video ~7 MB, well under Groq's 25 MB limit.
         "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": fmt}],
