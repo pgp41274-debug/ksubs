@@ -329,4 +329,120 @@ app._cookie_files = []
 assert app.with_cookies(lambda p: p) is None
 print("ok  no cookies configured -> single call with None")
 
+# ---- gemini: google fetches youtube, this host never does -----------------
+
+import json as _json
+
+assert app.video_id_of("https://www.youtube.com/watch?v=xj1NBNnlk4o&t=3") == "xj1NBNnlk4o"
+assert app.video_id_of("https://youtu.be/xj1NBNnlk4o") == "xj1NBNnlk4o"
+assert app.video_id_of("https://youtube.com/shorts/xj1NBNnlk4o") == "xj1NBNnlk4o"
+assert app.video_id_of(" xj1NBNnlk4o ") == "xj1NBNnlk4o"
+assert app.video_id_of("https://example.com/") == ""
+print("ok  video id extraction")
+
+# absolute times pass through; clip-relative ones get shifted onto the video
+absolute = app.clean_clip([{"start": 125.0, "end": 127.0, "ko": "가"}], 120, 240)
+assert (absolute[0]["start"], absolute[0]["end"]) == (125.0, 127.0), absolute
+relative = app.clean_clip([{"start": 5.0, "end": 7.0, "ko": "가"},
+                           {"start": 9.0, "end": 9.0, "ko": "나"}], 120, 240)
+assert [(c["start"], c["end"]) for c in relative] == [(125.0, 127.0), (129.0, 129.5)], relative
+junk = app.clean_clip([{"start": "x", "end": 1, "ko": "가"}, {"start": 1, "end": 2, "ko": " "}], 0, 120)
+assert junk == [], "malformed or empty segments must be dropped, not crash"
+print("ok  clip cleanup: absolute kept, relative shifted, junk dropped")
+
+# a line repeated on both sides of a clip boundary appears once; no overlaps
+st = app.stitch([
+    [{"start": 110.0, "end": 121.0, "ko": "줏대지", "en": ""}],
+    [{"start": 120.5, "end": 122.0, "ko": "줏대지", "en": ""},
+     {"start": 121.5, "end": 123.0, "ko": "줏대 아니야?", "en": ""}],
+])
+assert [c["ko"] for c in st] == ["줏대지", "줏대 아니야?"], st
+assert all(a["end"] <= b["start"] for a, b in zip(st, st[1:])), "stitched cues overlap"
+print("ok  stitch drops boundary duplicates and clamps overlaps")
+
+
+def reply(segs):
+    return {"candidates": [{"finishReason": "STOP", "content": {"parts": [
+        {"text": "thinking...", "thought": True},
+        {"text": _json.dumps({"segments": segs})}]}}]}
+
+
+def clip_of(body):
+    meta = _json.loads(body)["contents"][0]["parts"][0]["video_metadata"]
+    return int(meta["start_offset"][:-1])
+
+
+def fake_video(length, busy=(), dead=()):
+    """A Gemini stand-in for a video `length` seconds long. Models in `busy`
+    always 503; clips starting at a time in `dead` always 503."""
+    calls = []
+
+    def send(url, body, key, timeout):
+        a = clip_of(body)
+        model = url.split("/models/")[1].split(":")[0]
+        calls.append((model, a))
+        if model in busy or a in dead:
+            raise http_error(503)
+        if a >= length:
+            raise http_error(400)
+        return reply([{"start": a + 1.0, "end": a + 3.0, "ko": f"말{a}"}])
+    return send, calls
+
+
+quiet = lambda *a: None
+app.GEMINI_KEYS = ["G1"]
+app.GEMINI_MODELS = ["m-busy", "m-ok"]
+
+# an overloaded model falls through to the next one within the same clip
+send, calls = fake_video(300, busy={"m-busy"})
+cues, model = app.gemini_clip("xj1NBNnlk4o", 0, 120, send=send, log=quiet, rounds=1, wait=0)
+assert model == "m-ok" and cues[0]["ko"] == "말0", (model, cues)
+assert calls == [("m-busy", 0), ("m-ok", 0)], calls
+print("ok  overloaded model fails over to the next")
+
+# a clip past the end is how the length is discovered - not an error
+try:
+    app.gemini_clip("xj1NBNnlk4o", 360, 480, send=fake_video(300)[0], log=quiet, rounds=1, wait=0)
+    raise AssertionError("past-the-end clip should raise PastEnd")
+except app.PastEnd:
+    pass
+# ...but a 400 on the very first clip is a real failure (private video etc.)
+try:
+    app.gemini_clip("xj1NBNnlk4o", 0, 120, send=fake_video(0)[0], log=quiet, rounds=1, wait=0)
+    raise AssertionError("400 on clip 0 must be an error")
+except app.PastEnd:
+    raise AssertionError("400 on clip 0 must not look like end-of-video")
+except RuntimeError:
+    pass
+print("ok  400 past the end = end of video; 400 on clip 0 = real error")
+
+# whole video: every clip lands in order, then it stops at the end
+app.GEMINI_MODELS = ["m-ok"]
+send, calls = fake_video(300)
+job = {}
+cues, model = app.gemini_transcribe("xj1NBNnlk4o", job, send=send, log=quiet,
+                                    chunk=120, parallel=4, rounds=1, wait=0)
+assert [c["ko"] for c in cues] == ["말0", "말120", "말240"], cues
+assert not job.get("gaps"), job
+assert max(a for _, a in calls) == 360, f"should stop at the first wave past the end: {calls}"
+print("ok  whole video transcribed in order, stops at the end")
+
+# one clip that never succeeds leaves a marked gap instead of killing the job
+send, _ = fake_video(500, dead={120})
+job = {}
+cues, _ = app.gemini_transcribe("xj1NBNnlk4o", job, send=send, log=quiet,
+                                chunk=120, parallel=4, rounds=1, wait=0)
+assert [c["ko"] for c in cues] == ["말0", "말240", "말360", "말480"], cues
+assert job["gaps"] == ["2:00"], job
+print("ok  a dead middle clip leaves a gap, the rest survives")
+
+# if even the first clip dies, raise so run_job falls back to the yt-dlp route
+try:
+    app.gemini_transcribe("xj1NBNnlk4o", {}, send=fake_video(500, dead={0})[0], log=quiet,
+                          chunk=120, parallel=4, rounds=1, wait=0)
+    raise AssertionError("first clip failing must raise")
+except RuntimeError:
+    pass
+print("ok  first clip failing hands over to the fallback")
+
 print("\nall passed")
