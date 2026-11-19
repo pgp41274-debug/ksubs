@@ -153,6 +153,7 @@ function setMsg(text, isErr) {
 }
 
 const STAGES = {
+  gemini:     'Transcribing on Gemini',
   audio:      'Fetching audio',
   groq:       'Transcribing on Groq',
   captions:   'Looking for Korean captions',
@@ -176,12 +177,15 @@ async function poll() {
   if (j.stage === 'done') {
     $('#fill').style.width = '100%';
     const miss = j.untranslated ? ` · ${j.untranslated} untranslated` : '';
-    setMsg(`Done — ${cues.length} subtitles from ${j.source}${miss}`);
+    const gaps = (j.gaps || []).length ? ` · no subtitles near ${j.gaps.join(', ')}` : '';
+    setMsg(`Done — ${cues.length} subtitles from ${j.source}${miss}${gaps}`);
     $('#go').disabled = false;
     return;
   }
-  $('#fill').style.width = j.percent + '%';
-  setMsg(`${STAGES[j.stage]}… ${j.percent}%` + (cues.length ? ` · ${cues.length} cues` : ''));
+  // Gemini can't know the video length up front, so it reports cues, not a %
+  const pct = j.stage === 'gemini' ? '' : ` ${j.percent}%`;
+  $('#fill').style.width = (j.stage === 'gemini' ? 0 : j.percent) + '%';
+  setMsg(`${STAGES[j.stage]}…${pct}` + (cues.length ? ` · ${cues.length} cues` : ''));
   setTimeout(poll, 1000);
 }
 

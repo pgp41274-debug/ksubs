@@ -67,6 +67,20 @@ GROQ_MODEL = os.environ.get("KSUBS_GROQ_MODEL", "whisper-large-v3-turbo")
 GROQ_CHAT_URL = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_CHAT_MODEL = os.environ.get("KSUBS_CHAT_MODEL", "qwen/qwen3.8-27b")
 GROQ_MAX_MB = 25
+# Gemini fetches the YouTube video on Google's own servers, so this host never
+# touches YouTube for it - no bot-check, no cookies. Key: https://aistudio.google.com
+# Comma-separate keys to fail over, same as GROQ_API_KEY.
+_raw_gemini = os.environ.get("GEMINI_API_KEY") or _user_env("GEMINI_API_KEY")
+GEMINI_KEYS = [k.strip() for k in _raw_gemini.split(",") if k.strip()]
+GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+# tried in order; "high demand" 503s are common, so a second model is a real fallback.
+# 3.5-flash kept Korean wordplay that 3.6-flash "corrected" away in testing.
+GEMINI_MODELS = [m.strip() for m in os.environ.get(
+    "KSUBS_GEMINI_MODELS", "gemini-3.5-flash,gemini-3.6-flash,gemini-flash-latest"
+).split(",") if m.strip()]
+GEMINI_CHUNK = 120  # seconds per request: one request takes ~1-2 min, so chunks run in parallel
+GEMINI_PARALLEL = 4
+GEMINI_MAX_CHUNKS = 90  # 3 hours - a runaway guard, not a real limit
 # claude gives better Korean slang but needs `claude` + /login; groq needs only the key
 TRANSLATOR = os.environ.get("KSUBS_TRANSLATOR", "groq" if GROQ_KEY else "claude")
 YDL = {"quiet": True, "no_warnings": True, "noprogress": True,
@@ -445,6 +459,205 @@ def transcribe_groq(path: Path, log=print) -> list[dict]:
     return cues
 
 
+# ---------------------------------------------------------------- gemini (google fetches youtube)
+
+VIDEO_ID_RE = re.compile(r"(?:youtu\.be/|[?&]v=|/shorts/|/embed/|/live/)([\w-]{11})")
+
+
+def video_id_of(url: str) -> str:
+    m = VIDEO_ID_RE.search(url) or re.fullmatch(r"\s*([\w-]{11})\s*", url)
+    return m.group(1) if m else ""
+
+
+def oembed_title(video_id: str) -> str:
+    """Title without yt-dlp. oEmbed is a lightweight public endpoint that answered
+    from a datacenter IP in testing, where the player API gets bot-checked."""
+    q = urllib.parse.quote(f"https://www.youtube.com/watch?v={video_id}", safe="")
+    try:
+        with urllib.request.urlopen(
+                f"https://www.youtube.com/oembed?url={q}&format=json", timeout=20) as r:
+            return json.loads(r.read().decode("utf-8")).get("title", "")
+    except Exception:
+        return ""
+
+
+GEMINI_PROMPT = """Transcribe every line of Korean speech in this clip verbatim, in Korean. Do not translate, summarize or tidy up slang, swearing or wordplay - keep it exactly as spoken.
+One segment per spoken sentence or short utterance, including short replies like 어 or 응.
+Only include utterances that START inside this clip.
+Give start and end as seconds from the START OF THE FULL VIDEO (this clip begins at {a}s and ends at {b}s), with one decimal place."""
+
+GEMINI_SCHEMA = {
+    "type": "OBJECT",
+    "properties": {"segments": {"type": "ARRAY", "items": {
+        "type": "OBJECT",
+        "properties": {"start": {"type": "NUMBER"}, "end": {"type": "NUMBER"},
+                       "ko": {"type": "STRING"}},
+        "required": ["start", "end", "ko"]}}},
+    "required": ["segments"],
+}
+
+# overload and quota errors: try the next key/model. 400 is the request itself.
+GEMINI_RETRY = {429, 500, 502, 503, 504}
+
+
+class PastEnd(Exception):
+    """The clip starts after the video ends - Gemini answers 400 for that."""
+
+
+def _gemini_body(video_id: str, a: int, b: int) -> dict:
+    return {
+        "contents": [{"parts": [
+            {"file_data": {"file_uri": f"https://www.youtube.com/watch?v={video_id}"},
+             "video_metadata": {"start_offset": f"{a}s", "end_offset": f"{b}s"}},
+            {"text": GEMINI_PROMPT.format(a=a, b=b)},
+        ]}],
+        "generationConfig": {
+            "temperature": 0,
+            "responseMimeType": "application/json",
+            "responseSchema": GEMINI_SCHEMA,
+            "thinkingConfig": {"thinkingLevel": "low"},
+            # a 2-min clip needs ~3k tokens. Without a cap, a model stuck in a
+            # repeat loop ran 3 minutes to 65k tokens in testing before failing.
+            "maxOutputTokens": 8192,
+        },
+        # prank videos are fake fights and swearing; a filter tripping on that
+        # would silently drop half the subtitles
+        "safetySettings": [{"category": c, "threshold": "OFF"} for c in (
+            "HARM_CATEGORY_HARASSMENT", "HARM_CATEGORY_HATE_SPEECH",
+            "HARM_CATEGORY_SEXUALLY_EXPLICIT", "HARM_CATEGORY_DANGEROUS_CONTENT")],
+    }
+
+
+def _gemini_text(data: dict) -> str:
+    cands = data.get("candidates") or []
+    if not cands:
+        raise RuntimeError(f"Gemini returned no candidates: {str(data)[:200]}")
+    c = cands[0]
+    if c.get("finishReason") not in (None, "STOP"):
+        raise RuntimeError(f"Gemini stopped early: {c.get('finishReason')}")
+    parts = (c.get("content") or {}).get("parts") or []
+    return "".join(p.get("text", "") for p in parts if not p.get("thought"))
+
+
+def clean_clip(segs: list[dict], a: float, b: float) -> list[dict]:
+    """Turn one clip's raw segments into cues. The model is told to give absolute
+    times; if it gave clip-relative ones instead, shift them."""
+    cues = []
+    for s in segs:
+        try:
+            start, end, ko = float(s["start"]), float(s["end"]), str(s["ko"]).strip()
+        except (KeyError, TypeError, ValueError):
+            continue
+        if ko:
+            cues.append({"start": start, "end": end, "ko": ko, "en": ""})
+    if a > 0 and cues and max(c["start"] for c in cues) < a - 1:
+        for c in cues:
+            c["start"] += a
+            c["end"] += a
+    cues.sort(key=lambda c: c["start"])
+    out = []
+    for c in cues:
+        c["start"] = max(c["start"], a)
+        c["end"] = min(max(c["end"], c["start"] + 0.5), b + 5)
+        if c["start"] < b + 1:
+            out.append(c)
+    return out
+
+
+def stitch(chunks: list[list[dict]]) -> list[dict]:
+    """Join clips in order: drop a line repeated across a boundary, and clamp
+    each cue to end where the next begins so two never show at once."""
+    cues = sorted((c for ch in chunks for c in ch), key=lambda c: c["start"])
+    out: list[dict] = []
+    for c in cues:
+        # both clips heard the line that straddles their boundary: same text,
+        # overlapping time. Real repeats a moment apart don't overlap.
+        if out and c["ko"] == out[-1]["ko"] and c["start"] < out[-1]["end"]:
+            continue
+        out.append(c)
+    for x, y in zip(out, out[1:]):
+        x["end"] = min(x["end"], y["start"])
+    return [c for c in out if c["end"] > c["start"]]
+
+
+def _gemini_post(url, body: bytes, key: str, timeout: int) -> dict:
+    req = urllib.request.Request(url, data=body, headers={
+        "x-goog-api-key": key, "Content-Type": "application/json",
+        "User-Agent": "ksubs/1.0"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+
+def gemini_clip(video_id: str, a: int, b: int, send=_gemini_post, log=print,
+                rounds: int = 2, wait: float = 15) -> tuple[list[dict], str]:
+    """One clip -> (cues, model). Walks every model x key on overload errors,
+    then waits and goes round again. Raises PastEnd when a > video length."""
+    body = json.dumps(_gemini_body(video_id, a, b)).encode()
+    last = "no attempt made"
+    for rnd in range(rounds):
+        for model in GEMINI_MODELS:
+            for key in GEMINI_KEYS:
+                try:
+                    data = send(GEMINI_URL.format(model=model), body, key, 600)
+                    segs = json.loads(_gemini_text(data) or "{}").get("segments", [])
+                    return clean_clip(segs, a, b), model
+                except urllib.error.HTTPError as e:
+                    last = f"{model} HTTP {e.code}: {e.read().decode('utf-8', 'replace')[:160]}"
+                    if e.code == 400:
+                        if a > 0:
+                            raise PastEnd(a)
+                        raise RuntimeError(f"Gemini rejected the video - {last}")
+                    if e.code not in GEMINI_RETRY:
+                        raise RuntimeError(f"Gemini failed - {last}")
+                except (urllib.error.URLError, OSError, ValueError, RuntimeError) as e:
+                    last = f"{model}: {e}"  # dropped connection, bad JSON, early stop
+                log(f"  clip {a}s: {last} - trying next")
+        if rnd + 1 < rounds:
+            time.sleep(wait * (rnd + 1))
+    raise RuntimeError(f"Gemini failed on clip {a}s after {rounds} rounds - {last}")
+
+
+def gemini_transcribe(video_id: str, job: dict | None = None, send=_gemini_post,
+                      log=print, chunk=GEMINI_CHUNK, parallel=GEMINI_PARALLEL,
+                      **kw) -> tuple[list[dict], str]:
+    """Whole video, clip by clip, `parallel` clips at a time. The length is not
+    known up front (that would need yt-dlp), so it keeps going until a clip
+    reports PastEnd."""
+    chunks: dict[int, list[dict]] = {}
+    models: set[str] = set()
+    failed: list[int] = []
+    k, ended = 0, False
+    with ThreadPoolExecutor(max_workers=parallel) as ex:
+        while not ended and k < GEMINI_MAX_CHUNKS:
+            wave = list(range(k, min(k + parallel, GEMINI_MAX_CHUNKS)))
+            futs = {i: ex.submit(gemini_clip, video_id, i * chunk, (i + 1) * chunk,
+                                 send, log, **kw) for i in wave}
+            for i in wave:
+                try:
+                    cues, model = futs[i].result()
+                    chunks[i] = cues
+                    models.add(model)
+                except PastEnd:
+                    ended = True
+                except Exception as e:
+                    if i == 0:
+                        raise  # nothing worked: let run_job fall back to yt-dlp
+                    failed.append(i)  # one bad clip leaves a gap, not a dead job
+                    log(f"  clip {i * chunk}s gave up: {e}")
+            if not any(i in chunks for i in wave):
+                ended = True  # a whole wave with nothing back: stop, don't grind on
+            k += parallel
+            if job is not None:
+                job["cues"] = stitch([chunks[i] for i in sorted(chunks)])
+            log(f"  gemini: {len(chunks)} clip(s) done")
+    # a "failure" past the real end is just the end; only gaps before it count
+    last = max(chunks) if chunks else -1
+    gaps = [i for i in failed if i < last]
+    if job is not None and gaps:
+        job["gaps"] = [f"{i * chunk // 60}:{i * chunk % 60:02d}" for i in gaps]
+    return stitch([chunks[i] for i in sorted(chunks)]), "/".join(sorted(models))
+
+
 # ---------------------------------------------------------------- audio + whisper
 
 
@@ -562,6 +775,56 @@ def friendly_error(e: Exception) -> str:
 JOBS: dict[str, dict] = {}
 
 
+def _youtube_path(url, cookies, force_whisper, job, tmp, log):
+    """The original route: yt-dlp talks to YouTube from this host. Works locally;
+    on a datacenter IP it is what hits the bot-check."""
+    import yt_dlp
+
+    job.update(stage="captions", percent=0)
+
+    def attempt(cookie_path):
+        opts = dict(YDL, skip_download=True, **cookie_opts(cookie_path))
+        if cookies:
+            opts["cookiesfrombrowser"] = ("chrome",)
+        with yt_dlp.YoutubeDL(opts) as y:
+            return y.extract_info(url, download=False)
+
+    info = with_cookies(attempt, log)
+    job.update(title=info.get("title", ""), video_id=info.get("id", ""))
+    log(f"video: {info.get('title', '')}")
+
+    cues, source = None, None
+
+    # 1. Groq: real Whisper large-v3-turbo at ~220x realtime, free tier.
+    if GROQ_KEY and not force_whisper:
+        try:
+            job.update(stage="audio", percent=0)
+            mp3, _, _ = fetch_audio(url, tmp, job, cookies, fmt="mp3", log=log)
+            job.update(stage="groq", percent=0)
+            cues = transcribe_groq(mp3, log)
+            source = f"Groq {GROQ_MODEL}"
+        except Exception as e:
+            log(f"Groq failed ({e}) - falling back")
+            cues = None
+
+    # 2. YouTube's own Korean captions: seconds, no key needed.
+    if not cues and not force_whisper:
+        job.update(stage="captions", percent=0)
+        cues, source = fetch_captions(info, log)
+        if cues:
+            cues = merge_cues(cues)
+
+    # 3. Local Whisper: same quality as Groq but ~1x video length on this CPU.
+    if not cues:
+        log("Whisper requested" if force_whisper else "no captions - using local Whisper")
+        job.update(stage="audio", percent=0)
+        wav, _, _ = fetch_audio(url, tmp, job, cookies, fmt="wav", log=log)
+        job.update(stage="transcribe", percent=0)
+        cues = transcribe(wav, job, log)
+        source = "local Whisper"
+    return cues, source
+
+
 def run_job(job_id: str, url: str, cookies: bool, force_whisper: bool = False):
     job = JOBS[job_id]
 
@@ -570,50 +833,35 @@ def run_job(job_id: str, url: str, cookies: bool, force_whisper: bool = False):
 
     tmp = Path(tempfile.mkdtemp(prefix="ksubs-"))
     try:
-        import yt_dlp
+        cues, source, gemini_err = None, None, ""
 
-        job.update(stage="captions", percent=0)
-
-        def attempt(cookie_path):
-            opts = dict(YDL, skip_download=True, **cookie_opts(cookie_path))
-            if cookies:
-                opts["cookiesfrombrowser"] = ("chrome",)
-            with yt_dlp.YoutubeDL(opts) as y:
-                return y.extract_info(url, download=False)
-
-        info = with_cookies(attempt, log)
-        job.update(title=info.get("title", ""), video_id=info.get("id", ""))
-        log(f"video: {info.get('title', '')}")
-
-        cues, source = None, None
-
-        # 1. Groq: real Whisper large-v3-turbo at ~220x realtime, free tier.
-        if GROQ_KEY and not force_whisper:
+        # 0. Gemini: Google fetches the video itself, so nothing here talks to
+        # YouTube's player API and the datacenter bot-check never comes up.
+        vid = video_id_of(url)
+        if GEMINI_KEYS and vid and not force_whisper:
+            job.update(stage="gemini", percent=0, video_id=vid,
+                       title=oembed_title(vid))
+            log(f"video: {job['title'] or vid}")
             try:
-                job.update(stage="audio", percent=0)
-                mp3, _, _ = fetch_audio(url, tmp, job, cookies, fmt="mp3", log=log)
-                job.update(stage="groq", percent=0)
-                cues = transcribe_groq(mp3, log)
-                source = f"Groq {GROQ_MODEL}"
+                cues, model = gemini_transcribe(vid, job, log=log)
+                source = f"Gemini {model}"
+                if not cues:
+                    log("Gemini heard no speech - falling back")
             except Exception as e:
-                log(f"Groq failed ({e}) - falling back")
+                log(f"Gemini failed ({e}) - falling back")
+                gemini_err = str(e)
                 cues = None
 
-        # 2. YouTube's own Korean captions: seconds, no key needed.
-        if not cues and not force_whisper:
-            job.update(stage="captions", percent=0)
-            cues, source = fetch_captions(info, log)
-            if cues:
-                cues = merge_cues(cues)
-
-        # 3. Local Whisper: same quality as Groq but ~1x video length on this CPU.
         if not cues:
-            log("Whisper requested" if force_whisper else "no captions - using local Whisper")
-            job.update(stage="audio", percent=0)
-            wav, _, _ = fetch_audio(url, tmp, job, cookies, fmt="wav", log=log)
-            job.update(stage="transcribe", percent=0)
-            cues = transcribe(wav, job, log)
-            source = "local Whisper"
+            try:
+                cues, source = _youtube_path(url, cookies, force_whisper, job, tmp, log)
+            except Exception as e:
+                if not gemini_err:
+                    raise
+                # both routes died: say why Gemini did, not just the cookie story
+                raise RuntimeError(f"Gemini: {gemini_err[:300]}  |  then YouTube: "
+                                   f"{friendly_error(e)}") from e
+
         before = len(cues)
         cues = collapse_repeats(cues)
         if len(cues) != before:
@@ -690,6 +938,7 @@ def create_job(body: dict, _=Depends(require_password)):
         "source": "",
         "error": "",
         "untranslated": 0,
+        "gaps": [],
     }
     threading.Thread(
         target=run_job,
@@ -736,6 +985,9 @@ def check():
         print("             Free key, no card: https://console.groq.com/keys")
         print("             PowerShell, persists across windows:")
         print('               setx GROQ_API_KEY "gsk_..."   (then open a NEW window)')
+    if GEMINI_KEYS:
+        print(f"youtube    : Gemini {', '.join(GEMINI_MODELS)} fetches the video"
+              " (no cookies needed), yt-dlp only as fallback")
     if TRANSLATOR == "groq":
         print(f"translate  : Groq {GROQ_CHAT_MODEL}")
     else:
@@ -768,5 +1020,7 @@ if __name__ == "__main__":
         print("transcribe : NO GROQ KEY - will use YouTube auto-captions (lower quality)")
         print('             fix: setx GROQ_API_KEY "gsk_..."   then restart this')
         print(f"translate  : {TRANSLATOR}")
+    if GEMINI_KEYS:
+        print(f"youtube    : Gemini {GEMINI_MODELS[0]} first - no cookies needed")
     print("open http://localhost:8000")
     uvicorn.run(app, host="127.0.0.1", port=8000, log_level="warning")
