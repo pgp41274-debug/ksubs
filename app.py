@@ -74,6 +74,80 @@ TRANSLATOR = os.environ.get("KSUBS_TRANSLATOR", "groq" if GROQ_KEY else "claude"
 YDL = {"quiet": True, "no_warnings": False, "noprogress": True,
        "js_runtimes": {"deno": {}, "node": {}}}  # node is installed; without it YT extraction degrades
 
+# YouTube blocks cloud hosts' IPs outright (Nov 26: Render Oregon AND Singapore
+# got 403 on every player request, with and without cookies). Routing only the
+# YouTube traffic through a proxy gets a different IP; Groq calls go direct.
+#   KSUBS_PROXY=http://user:pass@host1:port,http://user:pass@host2:port,...
+# Several proxies fail over like cookie sets: a blocked or dead one is skipped
+# and whichever last worked is tried first. (Webshare's free plan: 10 proxies
+# sharing one 1 GB/month allowance - more proxies, not more data.)
+PROXIES = [p.strip() for p in os.environ.get("KSUBS_PROXY", "").split(",") if p.strip()]
+PROXY_TRIES = 3  # per job step: each dead proxy costs ~20-30s of 403 retries
+_proxy_idx = 0  # sticky: the proxy that last got through
+# free proxies meter bandwidth (Webshare: 1 GB/month), so through a proxy take
+# the smallest audio-only stream that's still fine for speech: ~50 kbps opus is
+# a third of "bestaudio", and Whisper downsamples to 16 kHz mono regardless
+AUDIO_FORMAT_PROXIED = "bestaudio[abr<=?70]/worstaudio/bestaudio/best"
+
+
+def proxy_opts(proxy: str | None) -> dict:
+    return {"proxy": proxy} if proxy else {}
+
+
+def current_proxy() -> str | None:
+    return PROXIES[_proxy_idx % len(PROXIES)] if PROXIES else None
+
+
+def _is_proxy_error(e: Exception) -> bool:
+    msg = str(e)
+    return any(k in msg for k in ("Unable to connect to proxy", "ProxyError",
+                                  "Tunnel connection failed", "407"))
+
+
+def with_proxies(fn, log=print):
+    """Call fn(proxy) with up to PROXY_TRIES proxies, starting from the one that
+    last worked, until YouTube lets one through. fn(None) if none configured.
+    If every try fails, the next job starts past them instead of on the same
+    dead ones."""
+    global _proxy_idx
+    if not PROXIES:
+        return fn(None)
+    tries = min(len(PROXIES), PROXY_TRIES)
+    last: Exception | None = None
+    for attempt in range(tries):
+        i = (_proxy_idx + attempt) % len(PROXIES)
+        try:
+            result = fn(PROXIES[i])
+            if attempt:
+                log(f"  proxy {i + 1}/{len(PROXIES)} ({proxy_label(PROXIES[i])}) worked")
+            _proxy_idx = i
+            return result
+        except Exception as e:
+            if not (_is_bot_check(e) or _is_proxy_error(e)):
+                raise
+            last = e
+            log(f"  proxy {i + 1}/{len(PROXIES)} ({proxy_label(PROXIES[i])}) failed: "
+                f"{'cannot connect' if _is_proxy_error(e) else 'blocked by YouTube'}")
+    _proxy_idx = (_proxy_idx + tries) % len(PROXIES)
+    raise last
+
+
+def proxy_label(url: str) -> str:
+    """host:port only - never put the proxy's username/password in a log line."""
+    p = urllib.parse.urlsplit(url)
+    return f"{p.hostname}:{p.port}" if p.hostname else "proxy"
+
+
+def youtube_urlopen(url: str, timeout: int = 60):
+    """urlopen for YouTube URLs (caption tracks) - through the proxy that last
+    got through, since that's the IP the caption URLs were issued to."""
+    proxy = current_proxy()
+    if not proxy:
+        return urllib.request.urlopen(url, timeout=timeout)
+    opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
+    return opener.open(url, timeout=timeout)
+
 # YouTube's bot-check on datacenter IPs is intermittent, not a clean pass/fail
 # per account - the same cookies can succeed right after failing. Multiple
 # throwaway accounts don't guarantee a fix (the shared server IP is still one
@@ -141,7 +215,8 @@ def _is_bot_check(e: Exception) -> bool:
     return ("not a bot" in msg or "Sign in to confirm" in msg
             or "page needs to be reloaded" in msg
             or "Requested format is not available" in msg
-            or "HTTP Error 403" in msg)
+            or "HTTP Error 403" in msg
+            or "Failed to extract any player response" in msg)
 
 
 def _label(path: str | None, files: list[str]) -> str:
@@ -435,7 +510,7 @@ def fetch_captions(info: dict, log=print):
         if not url:
             continue
         try:
-            raw = urllib.request.urlopen(url, timeout=60).read().decode("utf-8", "replace")
+            raw = youtube_urlopen(url, timeout=60).read().decode("utf-8", "replace")
         except Exception as e:
             log(f"  {label} fetch failed: {e}")
             continue
@@ -499,9 +574,9 @@ def fetch_audio(url: str, outdir: Path, job: dict, cookies: bool = False,
             if tot:
                 job["percent"] = int(d.get("downloaded_bytes", 0) / tot * 100)
 
-    def attempt(cookie_path):
+    def attempt(cookie_path, proxy):
         opts = {
-            "format": "bestaudio/best",
+            "format": AUDIO_FORMAT_PROXIED if proxy else "bestaudio/best",
             "outtmpl": str(outdir / "audio.%(ext)s"),
             "quiet": True,
             "no_warnings": False,
@@ -520,13 +595,14 @@ def fetch_audio(url: str, outdir: Path, job: dict, cookies: bool = False,
                 + ([] if fmt == "wav" else ["-b:a", "32k"])
             },
             **cookie_opts(cookie_path),
+            **proxy_opts(proxy),
         }
         if cookies:
             opts["cookiesfrombrowser"] = ("chrome",)
         with yt_dlp.YoutubeDL(opts) as y:
             return y.extract_info(url, download=True)
 
-    info = with_cookies(attempt, log)
+    info = with_proxies(lambda px: with_cookies(lambda c: attempt(c, px), log), log)
     return outdir / f"audio.{fmt}", info.get("title", ""), info.get("id", "")
 
 
@@ -577,7 +653,10 @@ def transcribe(wav: Path, job: dict, log=print) -> list[dict]:
 
 # ---------------------------------------------------------------- job runner
 
-RENDER_ENV_URL = "https://dashboard.render.com/web/srv-da7o937avr4c73bb6qb0/env"
+# Render sets RENDER_SERVICE_ID on every service, so the link in error
+# messages points at whichever service (Oregon, Singapore...) is running
+RENDER_ENV_URL = ("https://dashboard.render.com/web/"
+                  f"{os.environ.get('RENDER_SERVICE_ID', 'srv-da7o937avr4c73bb6qb0')}/env")
 
 
 def friendly_error(e: Exception) -> str:
@@ -585,6 +664,20 @@ def friendly_error(e: Exception) -> str:
     widely-reported 2026 limitation, not a bug here) - turn yt-dlp's raw error
     into the actual fix instead of a wall of technical text."""
     msg = str(e)
+    if PROXIES and _is_proxy_error(e):
+        return (
+            "Couldn't connect through the proxies in KSUBS_PROXY - check their "
+            "addresses and password, or that the free bandwidth isn't used up: "
+            f"{RENDER_ENV_URL}"
+        )
+    if PROXIES and ("HTTP Error 403" in msg or "HTTP Error 429" in msg
+                  or "Requested format is not available" in msg
+                  or "Failed to extract any player response" in msg):
+        return (
+            "YouTube blocked the proxies tried for this job. The next job "
+            "automatically tries the next ones in KSUBS_PROXY - just run it "
+            f"again. If all of them are blocked, replace them: {RENDER_ENV_URL}"
+        )
     if "not a bot" in msg or "Sign in to confirm" in msg:
         return (
             "YouTube's session cookies have expired (normal after a few hours "
@@ -619,14 +712,17 @@ def run_job(job_id: str, url: str, cookies: bool, force_whisper: bool = False):
     try:
         import yt_dlp
 
+        log(f"youtube via proxy {_proxy_idx % len(PROXIES) + 1}/{len(PROXIES)} "
+            f"({proxy_label(current_proxy())})" if PROXIES else "youtube direct (no KSUBS_PROXY)")
+
         job.update(stage="captions", percent=0)
 
-        def attempt(cookie_path):
+        def attempt(cookie_path, proxy):
             # only title, id and caption tracks are read here. Without this, a
             # video whose audio is blocked fails right here and the captions
             # fallback never gets its turn
             opts = dict(YDL, skip_download=True, ignore_no_formats_error=True,
-                        **cookie_opts(cookie_path))
+                        **cookie_opts(cookie_path), **proxy_opts(proxy))
             if cookies:
                 opts["cookiesfrombrowser"] = ("chrome",)
             with yt_dlp.YoutubeDL(opts) as y:
@@ -638,7 +734,7 @@ def run_job(job_id: str, url: str, cookies: bool, force_whisper: bool = False):
                                    "(YouTube returned no audio and no captions)")
             return info
 
-        info = with_cookies(attempt, log)
+        info = with_proxies(lambda px: with_cookies(lambda c: attempt(c, px), log), log)
         job.update(title=info.get("title", ""), video_id=info.get("id", ""))
         log(f"video: {info.get('title', '')}")
 
@@ -829,5 +925,8 @@ if __name__ == "__main__":
         print("transcribe : NO GROQ KEY - will use YouTube auto-captions (lower quality)")
         print('             fix: setx GROQ_API_KEY "gsk_..."   then restart this')
         print(f"translate  : {TRANSLATOR}")
+    if PROXIES:
+        print(f"youtube    : via {len(PROXIES)} prox{'ies' if len(PROXIES) > 1 else 'y'}, "
+              f"first {proxy_label(PROXIES[0])}")
     print("open http://localhost:8000")
     uvicorn.run(app, host="127.0.0.1", port=8000, log_level="warning")
