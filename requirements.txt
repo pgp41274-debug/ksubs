@@ -1,0 +1,11 @@
+# Hosted (Render) dependencies. Render build command:
+#   pip install -U pip && pip install -U -r requirements.txt
+# -U matters: without it pip keeps whatever is already installed, and an old
+# yt-dlp is the usual reason YouTube extraction breaks.
+fastapi>=0.165.0
+uvicorn[standard]>=0.54.0
+# [default] bundles yt-dlp-ejs, the YouTube JS-challenge solver, instead of
+# fetching it from GitHub at runtime
+yt-dlp[default]>=2026.11.23
+imageio-ffmpeg>=0.8.1
+deno>=2.9.8
