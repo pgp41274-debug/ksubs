@@ -134,32 +134,46 @@ def cookie_opts(path: str | None) -> dict:
 
 
 def _is_bot_check(e: Exception) -> bool:
+    """YouTube refusing this server, as opposed to the video itself being
+    unavailable. Nov 26: the player API answered HTTP 403 to every logged-in
+    request, which surfaces as "Requested format is not available"."""
     msg = str(e)
     return ("not a bot" in msg or "Sign in to confirm" in msg
-            or "page needs to be reloaded" in msg)
+            or "page needs to be reloaded" in msg
+            or "Requested format is not available" in msg
+            or "HTTP Error 403" in msg)
+
+
+def _label(path: str | None, files: list[str]) -> str:
+    return f"cookie set {files.index(path) + 1}/{len(files)}" if path else "no cookies"
 
 
 def with_cookies(fn, log=print):
-    """Call fn(cookie_path) once per available cookie set, starting from
-    whichever one last worked, until one doesn't hit YouTube's bot-check.
-    fn(None) once if no cookies are configured at all."""
+    """Call fn(cookie_path) for each cookie set and finally with no cookies at
+    all, starting from whichever last worked, until YouTube stops refusing.
+    A refused or flagged account makes YouTube reject every logged-in request,
+    while an anonymous one from the same IP can still get through - so "no
+    cookies" is one more option, not only the default."""
     global _cookie_idx
     files = _load_cookie_files()
-    if not files:
-        return fn(None)
+    options = files + [None]
     last: Exception | None = None
-    for attempt in range(len(files)):
-        i = (_cookie_idx + attempt) % len(files)
+    for attempt in range(len(options)):
+        i = (_cookie_idx + attempt) % len(options)
         try:
-            result = fn(files[i])
+            result = fn(options[i])
+            if attempt:
+                log(f"  {_label(options[i], files)} worked")
             _cookie_idx = i
             return result
         except Exception as e:
             if not _is_bot_check(e):
                 raise
             last = e
-            if attempt + 1 < len(files):
-                log(f"  cookie set {i + 1}/{len(files)} bot-checked, trying set {i + 2}")
+            if attempt + 1 < len(options):
+                nxt = options[(i + 1) % len(options)]
+                log(f"  {_label(options[i], files)} refused by YouTube, "
+                    f"trying {_label(nxt, files)}")
     raise last
 
 
@@ -405,6 +419,13 @@ def collapse_repeats(cues: list[dict]) -> list[dict]:
     return out
 
 
+def has_audio_or_captions(info: dict) -> bool:
+    """False when YouTube's player API refused us and only thumbnails came back."""
+    audio = any(f.get("acodec") not in (None, "none") for f in info.get("formats") or ())
+    tracks = list(info.get("subtitles") or {}) + list(info.get("automatic_captions") or {})
+    return audio or any(t == "ko" or t.startswith("ko-") for t in tracks)
+
+
 def fetch_captions(info: dict, log=print):
     """Korean subtitles straight from YouTube: seconds instead of minutes.
     Returns (cues, source) or (None, None) if this video has no Korean track."""
@@ -571,10 +592,10 @@ def friendly_error(e: Exception) -> str:
         )
     if "Requested format is not available" in msg:
         return (
-            "YouTube let this server see the video but offered no audio to "
-            "download (usually an unsolved YouTube challenge or a missing PO "
-            "token on a cloud IP). The Render log lines just before this error "
-            "say which. Fresh YTDLP_COOKIES sometimes help: " + RENDER_ENV_URL
+            "YouTube refused this server's requests (HTTP 403 in the Render "
+            "log), with every cookie set and without cookies. If the log shows "
+            "403s, the Google account behind YTDLP_COOKIES is likely rejected: "
+            "export cookies from a different throwaway account: " + RENDER_ENV_URL
         )
     if "page needs to be reloaded" in msg:
         return (
@@ -609,7 +630,13 @@ def run_job(job_id: str, url: str, cookies: bool, force_whisper: bool = False):
             if cookies:
                 opts["cookiesfrombrowser"] = ("chrome",)
             with yt_dlp.YoutubeDL(opts) as y:
-                return y.extract_info(url, download=False)
+                info = y.extract_info(url, download=False)
+            if not has_audio_or_captions(info):
+                # thumbnails only: the player API refused us. Say so, so the
+                # next cookie set (or no cookies) gets a turn
+                raise RuntimeError("Requested format is not available "
+                                   "(YouTube returned no audio and no captions)")
+            return info
 
         info = with_cookies(attempt, log)
         job.update(title=info.get("title", ""), video_id=info.get("id", ""))
