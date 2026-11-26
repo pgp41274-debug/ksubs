@@ -326,8 +326,36 @@ print("ok  non-bot-check errors do not waste the backup cookie set")
 
 # no cookies configured at all -> fn(None) once, untouched
 app._cookie_files = []
+app._cookie_idx = 0
 assert app.with_cookies(lambda p: p) is None
 print("ok  no cookies configured -> single call with None")
+
+# every cookie set refused (Nov 26: HTTP 403 on all logged-in requests):
+# try once with no cookies, and stick to that while it keeps working
+app._cookie_files = ["/set0.txt", "/set1.txt"]
+app._cookie_idx = 0
+seen = []
+
+
+def cookies_refused(path):
+    seen.append(path)
+    if path:
+        raise Exception("ERROR: [youtube] x: Requested format is not available.")
+    return "anonymous ok"
+
+
+assert app.with_cookies(cookies_refused, log=lambda *a: None) == "anonymous ok"
+assert seen == ["/set0.txt", "/set1.txt", None], seen
+seen.clear()
+app.with_cookies(cookies_refused, log=lambda *a: None)
+assert seen == [None], f"should stick to no-cookies once it works, tried {seen}"
+print("ok  refused cookie sets fall back to no cookies, and that sticks")
+
+# a thumbnails-only reply is a refusal; captions alone are enough to go on
+assert not app.has_audio_or_captions({"formats": [{"acodec": "none", "ext": "mhtml"}]})
+assert app.has_audio_or_captions({"formats": [], "automatic_captions": {"ko": []}})
+assert app.has_audio_or_captions({"formats": [{"acodec": "opus"}]})
+print("ok  thumbnails-only reply detected as a refusal")
 
 # ---- cookies pasted through a web form lose their tabs --------------------
 
@@ -345,7 +373,7 @@ assert app.fix_cookie_tabs(good).strip() == good, "an already-correct file must 
 print("ok  cookie lines with spaces get their tabs back")
 
 msg = app.friendly_error(Exception("ERROR: [youtube] IU4gpmCAZhc: Requested format is not available."))
-assert "no audio" in msg and "log" in msg, msg
+assert "403" in msg and "throwaway account" in msg, msg
 print("ok  format error explained, points at the log")
 
 print("\nall passed")
