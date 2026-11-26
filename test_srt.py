@@ -376,4 +376,29 @@ msg = app.friendly_error(Exception("ERROR: [youtube] IU4gpmCAZhc: Requested form
 assert "403" in msg and "throwaway account" in msg, msg
 print("ok  format error explained, points at the log")
 
+# ---- proxy: only YouTube traffic, credentials never logged ----------------
+
+app.PROXY = ""
+assert app.proxy_opts() == {}, "no proxy configured -> yt-dlp opts untouched"
+app.PROXY = "http://user1:s3cret@p.webshare.io:80"
+assert app.proxy_opts() == {"proxy": "http://user1:s3cret@p.webshare.io:80"}
+label = app.proxy_label(app.PROXY)
+assert label == "p.webshare.io:80" and "s3cret" not in label and "user1" not in label, label
+
+# through a proxy, errors point at the proxy instead of blaming cookies
+msg = app.friendly_error(Exception("ERROR: Unable to connect to proxy ... 407 Proxy Authentication Required"))
+assert "KSUBS_PROXY" in msg and "password" in msg, msg
+msg = app.friendly_error(Exception("ERROR: [youtube] x: Failed to extract any player response"))
+assert "proxy's IP" in msg, msg
+app.PROXY = ""
+msg = app.friendly_error(Exception("ERROR: [youtube] x: Failed to extract any player response"))
+assert "proxy" not in msg.lower(), "without a proxy, don't mention one"
+print("ok  proxy opts, credential-free log label, proxy-aware errors")
+
+# the proxied audio format must still select something on every video:
+# each alternative is a real yt-dlp selector, and it ends in a catch-all
+alts = app.AUDIO_FORMAT_PROXIED.split("/")
+assert alts[0].startswith("bestaudio[abr<=?") and alts[-1] == "best", alts
+print("ok  proxied audio format prefers a small stream, falls back to anything")
+
 print("\nall passed")
