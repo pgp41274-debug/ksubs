@@ -69,7 +69,9 @@ GROQ_CHAT_MODEL = os.environ.get("KSUBS_CHAT_MODEL", "qwen/qwen3.8-27b")
 GROQ_MAX_MB = 25
 # claude gives better Korean slang but needs `claude` + /login; groq needs only the key
 TRANSLATOR = os.environ.get("KSUBS_TRANSLATOR", "groq" if GROQ_KEY else "claude")
-YDL = {"quiet": True, "no_warnings": True, "noprogress": True,
+# warnings stay ON: "Requested format is not available" is only explained by
+# the warnings before it (unsolved JS challenge, missing PO token, bad cookie line)
+YDL = {"quiet": True, "no_warnings": False, "noprogress": True,
        "js_runtimes": {"deno": {}, "node": {}}}  # node is installed; without it YT extraction degrades
 
 # YouTube's bot-check on datacenter IPs is intermittent, not a clean pass/fail
@@ -83,6 +85,23 @@ _cookie_files: list[str] | None = None
 _cookie_idx = 0  # sticky: keep using whichever set last worked
 
 
+def fix_cookie_tabs(text: str) -> str:
+    """cookies.txt needs TAB-separated fields. Pasting it into a web form (the
+    Render dashboard) turns tabs into spaces, and yt-dlp then skips every line
+    ("invalid length 1") - silently running with no cookies at all. Rebuild the
+    tabs: each entry has exactly 7 fields and cookie values contain no spaces."""
+    out = []
+    for line in text.splitlines():
+        entry = line.strip()
+        is_entry = entry and (not entry.startswith("#") or entry.startswith("#HttpOnly_"))
+        if is_entry and "\t" not in entry:
+            fields = entry.split(None, 6)
+            if len(fields) == 7:
+                line = "\t".join(fields)
+        out.append(line)
+    return "\n".join(out) + "\n"
+
+
 def _load_cookie_files() -> list[str]:
     global _cookie_files
     if _cookie_files is None:
@@ -91,7 +110,7 @@ def _load_cookie_files() -> list[str]:
         _cookie_files = []
         for i, block in enumerate(blocks):
             f = Path(tempfile.gettempdir()) / f"ksubs_cookies_{i}.txt"
-            f.write_text(block, encoding="utf-8")
+            f.write_text(fix_cookie_tabs(block), encoding="utf-8")
             _cookie_files.append(str(f))
     return _cookie_files
 
@@ -464,7 +483,7 @@ def fetch_audio(url: str, outdir: Path, job: dict, cookies: bool = False,
             "format": "bestaudio/best",
             "outtmpl": str(outdir / "audio.%(ext)s"),
             "quiet": True,
-            "no_warnings": True,
+            "no_warnings": False,
             "noprogress": True,
             "progress_hooks": [hook],
             # YouTube extraction is degraded without a JS runtime; node is already installed
@@ -550,6 +569,13 @@ def friendly_error(e: Exception) -> str:
             "YouTube's session cookies have expired (normal after a few hours "
             f"on a cloud server) - refresh YTDLP_COOKIES at {RENDER_ENV_URL}"
         )
+    if "Requested format is not available" in msg:
+        return (
+            "YouTube let this server see the video but offered no audio to "
+            "download (usually an unsolved YouTube challenge or a missing PO "
+            "token on a cloud IP). The Render log lines just before this error "
+            "say which. Fresh YTDLP_COOKIES sometimes help: " + RENDER_ENV_URL
+        )
     if "page needs to be reloaded" in msg:
         return (
             "YouTube rejected this request (challenge failed) - try again in a "
@@ -575,7 +601,11 @@ def run_job(job_id: str, url: str, cookies: bool, force_whisper: bool = False):
         job.update(stage="captions", percent=0)
 
         def attempt(cookie_path):
-            opts = dict(YDL, skip_download=True, **cookie_opts(cookie_path))
+            # only title, id and caption tracks are read here. Without this, a
+            # video whose audio is blocked fails right here and the captions
+            # fallback never gets its turn
+            opts = dict(YDL, skip_download=True, ignore_no_formats_error=True,
+                        **cookie_opts(cookie_path))
             if cookies:
                 opts["cookiesfrombrowser"] = ("chrome",)
             with yt_dlp.YoutubeDL(opts) as y:
@@ -607,6 +637,10 @@ def run_job(job_id: str, url: str, cookies: bool, force_whisper: bool = False):
                 cues = merge_cues(cues)
 
         # 3. Local Whisper: same quality as Groq but ~1x video length on this CPU.
+        if not cues and HOSTED:
+            raise RuntimeError(
+                "no Korean captions on this video, and YouTube gave this server no "
+                "audio to transcribe (Requested format is not available)")
         if not cues:
             log("Whisper requested" if force_whisper else "no captions - using local Whisper")
             job.update(stage="audio", percent=0)

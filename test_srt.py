@@ -329,4 +329,23 @@ app._cookie_files = []
 assert app.with_cookies(lambda p: p) is None
 print("ok  no cookies configured -> single call with None")
 
+# ---- cookies pasted through a web form lose their tabs --------------------
+
+spaced = (
+    "# Netscape HTTP Cookie File\n"
+    ".youtube.com  TRUE  /  TRUE  0  YSC  tRZTEI7xYvI\n"
+    "#HttpOnly_.youtube.com TRUE / TRUE 1810658056 __Secure-YNID Cu0BCAUSnwEB\n"
+)
+fixed = app.fix_cookie_tabs(spaced).splitlines()
+assert fixed[0] == "# Netscape HTTP Cookie File", "comments must be left alone"
+assert fixed[1].split("\t") == [".youtube.com", "TRUE", "/", "TRUE", "0", "YSC", "tRZTEI7xYvI"], fixed[1]
+assert fixed[2].split("\t")[0] == "#HttpOnly_.youtube.com", "HttpOnly entries are cookies, not comments"
+good = ".youtube.com\tTRUE\t/\tTRUE\t0\tYSC\tabc"
+assert app.fix_cookie_tabs(good).strip() == good, "an already-correct file must not change"
+print("ok  cookie lines with spaces get their tabs back")
+
+msg = app.friendly_error(Exception("ERROR: [youtube] IU4gpmCAZhc: Requested format is not available."))
+assert "no audio" in msg and "log" in msg, msg
+print("ok  format error explained, points at the log")
+
 print("\nall passed")
