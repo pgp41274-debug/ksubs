@@ -376,27 +376,94 @@ msg = app.friendly_error(Exception("ERROR: [youtube] IU4gpmCAZhc: Requested form
 assert "403" in msg and "throwaway account" in msg, msg
 print("ok  format error explained, points at the log")
 
-# ---- proxy: only YouTube traffic, credentials never logged ----------------
+# ---- proxies: only YouTube traffic, fail over, credentials never logged ---
 
-app.PROXY = ""
-assert app.proxy_opts() == {}, "no proxy configured -> yt-dlp opts untouched"
-app.PROXY = "http://user1:s3cret@p.webshare.io:80"
-assert app.proxy_opts() == {"proxy": "http://user1:s3cret@p.webshare.io:80"}
-label = app.proxy_label(app.PROXY)
+assert app.proxy_opts(None) == {}, "no proxy -> yt-dlp opts untouched"
+assert app.proxy_opts("http://u:p@h:1") == {"proxy": "http://u:p@h:1"}
+label = app.proxy_label("http://user1:s3cret@p.webshare.io:80")
 assert label == "p.webshare.io:80" and "s3cret" not in label and "user1" not in label, label
 
-# through a proxy, errors point at the proxy instead of blaming cookies
-msg = app.friendly_error(Exception("ERROR: Unable to connect to proxy ... 407 Proxy Authentication Required"))
+quiet = lambda *a: None
+P = [f"http://u:pw@p{i}.webshare.io:80" for i in range(5)]
+app.PROXIES, app._proxy_idx = list(P), 0
+tried = []
+
+
+def blocked_until_p2(proxy):
+    tried.append(proxy)
+    if proxy in (P[0], P[1]):
+        raise Exception("ERROR: [youtube] x: Failed to extract any player response")
+    return "ok via " + proxy
+
+
+assert app.with_proxies(blocked_until_p2, log=quiet) == "ok via " + P[2]
+assert tried == P[:3], tried
+tried.clear()
+app.with_proxies(blocked_until_p2, log=quiet)
+assert tried == [P[2]], f"should stick to the proxy that worked, tried {tried}"
+print("ok  blocked proxies fail over, the working one sticks")
+
+# a proxy that can't even connect also fails over
+app._proxy_idx = 0
+tried.clear()
+
+
+def p0_dead(proxy):
+    tried.append(proxy)
+    if proxy == P[0]:
+        raise Exception("Unable to connect to proxy: 407 Proxy Authentication Required")
+    return "ok"
+
+
+assert app.with_proxies(p0_dead, log=quiet) == "ok" and tried == P[:2], tried
+print("ok  unreachable proxy fails over")
+
+# at most PROXY_TRIES per job; the next job starts on fresh proxies
+app._proxy_idx = 0
+tried.clear()
+
+
+def all_blocked(proxy):
+    tried.append(proxy)
+    raise Exception("ERROR: [youtube] x: Unable to download API page: HTTP Error 403: Forbidden")
+
+
+try:
+    app.with_proxies(all_blocked, log=quiet)
+    raise AssertionError("should raise when every tried proxy is blocked")
+except Exception as e:
+    assert "403" in str(e), e
+assert tried == P[: app.PROXY_TRIES], f"must cap tries per job, tried {len(tried)}"
+tried.clear()
+try:
+    app.with_proxies(all_blocked, log=quiet)
+except Exception:
+    pass
+assert tried[0] == P[app.PROXY_TRIES], f"next job should start on untried proxies, got {tried[0]}"
+print("ok  tries capped per job, next job moves on to untried proxies")
+
+# a real video problem must not burn through proxies
+app._proxy_idx = 0
+tried.clear()
+try:
+    app.with_proxies(lambda px: tried.append(px) or (_ for _ in ()).throw(
+        Exception("ERROR: [youtube] x: Video unavailable")), log=quiet)
+except Exception as e:
+    assert "Video unavailable" in str(e)
+assert len(tried) == 1, tried
+print("ok  'video unavailable' does not rotate proxies")
+
+# through proxies, errors point at proxies instead of blaming cookies
+msg = app.friendly_error(Exception("Unable to connect to proxy ... 407 Proxy Authentication Required"))
 assert "KSUBS_PROXY" in msg and "password" in msg, msg
 msg = app.friendly_error(Exception("ERROR: [youtube] x: Failed to extract any player response"))
-assert "proxy's IP" in msg, msg
-app.PROXY = ""
+assert "next ones in KSUBS_PROXY" in msg, msg
+app.PROXIES = []
+assert app.with_proxies(lambda px: px, log=quiet) is None, "no proxies -> one direct call"
 msg = app.friendly_error(Exception("ERROR: [youtube] x: Failed to extract any player response"))
-assert "proxy" not in msg.lower(), "without a proxy, don't mention one"
-print("ok  proxy opts, credential-free log label, proxy-aware errors")
+assert "prox" not in msg.lower(), "without proxies, don't mention them"
+print("ok  proxy-aware error messages")
 
-# the proxied audio format must still select something on every video:
-# each alternative is a real yt-dlp selector, and it ends in a catch-all
 alts = app.AUDIO_FORMAT_PROXIED.split("/")
 assert alts[0].startswith("bestaudio[abr<=?") and alts[-1] == "best", alts
 print("ok  proxied audio format prefers a small stream, falls back to anything")
